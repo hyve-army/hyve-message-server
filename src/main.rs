@@ -5,39 +5,50 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use log::info;
 
+// TODO: none of these methods have authentication built in
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Conversation {
+struct KeyExchange {
     initiator_falcon_pubkey: String,
     responder_falcon_pubkey: String,
     initiator_kyber_pubkey: String,
+    initiator_signature: String,
+    responder_signature: Option<String>,
     encapsulated_secret: Option<String>,
-    status: ConversationStatus,
+    status: KeyExchangeStatus,
     created_at: DateTime<Utc>,
+    paired_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-enum ConversationStatus {
-    Pending,    // Waiting for responder
+enum KeyExchangeStatus {
+    Initiated,    // Waiting for responder
+    Paired,      // Responder pairs their key, sends encapsulated secret
     Complete,   // Both parties have exchanged keys
     Expired     // Timed out waiting for response
 }
 
 #[derive(Deserialize)]
-struct InitConversationRequest {
+struct InitKeyExchangeRequest {
     initiator_falcon_pubkey: String,
     responder_falcon_pubkey: String,
-    kyber_pubkey: String,
-    signature: String,
+    initiator_kyber_pubkey: String,
+    initiator_signature: String,
 }
 
 #[derive(Deserialize)]
-struct CompleteConversationRequest {
+struct PairKeyExchangeRequest {
     initiator_falcon_pubkey: String,
     responder_falcon_pubkey: String,
-    kyber_ciphertext: String,
-    signature: String,
+    encapsulated_secret: String,
+    responder_signature: String,
+}
+
+#[derive(Deserialize)]
+struct CompleteKeyExchangeRequest {
+    initiator_falcon_pubkey: String,
+    responder_falcon_pubkey: String,
 }
 
 // Structure for messages
@@ -51,7 +62,7 @@ struct Message {
 
 // Structure to hold messages for each recipient
 struct AppState {
-    conversations: Mutex<HashMap<String, Conversation>>,
+    key_exchanges: Mutex<HashMap<String, KeyExchange>>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
 }
 
@@ -99,93 +110,161 @@ async fn get_messages(
     }
 }
 
-// Initialize a conversation
-async fn init_conversation(
+// Initialize a key exchange
+async fn init_key_exchange(
     data: web::Data<AppState>,
-    req: web::Json<InitConversationRequest>,
+    req: web::Json<InitKeyExchangeRequest>,
 ) -> impl Responder {
-    info!("Received init conversation request from: {}", req.initiator_falcon_pubkey);
-    let mut conversations = data.conversations.lock().unwrap();
+    info!("Received init key exchange request from: {} to: {}", req.initiator_falcon_pubkey, req.responder_falcon_pubkey);
+    let mut key_exchanges = data.key_exchanges.lock().unwrap();
 
-    let conversation_id = format!("{}:{}", req.initiator_falcon_pubkey, req.responder_falcon_pubkey);
+    let exchange_id = format!("{}:{}", req.initiator_falcon_pubkey, req.responder_falcon_pubkey);
 
     // Check if there's already an active conversation
     // TODO: enable ratchet here under some conditions
-    if let Some(existing) = conversations.get(&conversation_id) {
-        if existing.status == ConversationStatus::Complete {
-            return HttpResponse::Conflict().json("Active conversation already exists");
+    if let Some(existing) = key_exchanges.get(&exchange_id) {
+        if existing.status == KeyExchangeStatus::Complete {
+            return HttpResponse::Conflict().json("Active key exchange already exists");
         }
     }
 
-    let conversation = Conversation {
+    let key_exchange = KeyExchange {
         initiator_falcon_pubkey: req.initiator_falcon_pubkey.clone(),
         responder_falcon_pubkey: req.responder_falcon_pubkey.clone(),
-        initiator_kyber_pubkey: req.kyber_pubkey.clone(),
+        initiator_kyber_pubkey: req.initiator_kyber_pubkey.clone(),
+        initiator_signature: req.initiator_signature.clone(),
+        responder_signature: None,
         encapsulated_secret: None,
-        status: ConversationStatus::Pending,
+        status: KeyExchangeStatus::Initiated,
         created_at: Utc::now(),
+        paired_at: None,
         completed_at: None,
     };
 
-    conversations.insert(conversation_id.clone(), conversation.clone());
+    key_exchanges.insert(exchange_id.clone(), key_exchange.clone());
 
-    HttpResponse::Ok().json(conversation)
+    HttpResponse::Ok().json(key_exchange)
+}
+
+async fn pair_exchange(
+    data: web::Data<AppState>,
+    req: web::Json<PairKeyExchangeRequest>,
+) -> impl Responder {
+    info!("Received pair key exchange request from: {} to: {}", req.responder_falcon_pubkey, req.initiator_falcon_pubkey);
+    let mut key_exchanges = data.key_exchanges.lock().unwrap();
+
+    // Form the lookup key from the initiator and responder public keys
+    let exchange_id = format!("{}:{}", req.initiator_falcon_pubkey, req.responder_falcon_pubkey);
+
+    if let Some(mut key_exchange) = key_exchanges.get_mut(&exchange_id) {
+        if key_exchange.status != KeyExchangeStatus::Initiated {
+            return HttpResponse::BadRequest().json("Key exchange not in Initiated state");
+        }
+
+        key_exchange.responder_signature = Some(req.responder_signature.clone());
+        key_exchange.encapsulated_secret = Some(req.encapsulated_secret.clone());
+        key_exchange.status = KeyExchangeStatus::Paired;
+        key_exchange.paired_at = Some(Utc::now());
+
+        HttpResponse::Ok().json(key_exchange)
+    } else {
+        HttpResponse::NotFound().finish()
+    }
 }
 
 // Complete the conversation with encapsulated key
-async fn complete_conversation(
+async fn complete_exchange(
     data: web::Data<AppState>,
-    req: web::Json<CompleteConversationRequest>,
+    req: web::Json<CompleteKeyExchangeRequest>,
 ) -> impl Responder {
-    info!("Received complete conversation request from: {}", req.responder_falcon_pubkey);
-    let mut conversations = data.conversations.lock().unwrap();
+    info!("Received complete key exchange request from: {}", req.initiator_falcon_pubkey);
+    let mut key_exchanges = data.key_exchanges.lock().unwrap();
 
     // Form the lookup key from the initiator and responder public keys
     let conversation_id = format!("{}:{}", req.initiator_falcon_pubkey, req.responder_falcon_pubkey);
 
-    if let Some(mut conversation) = conversations.get_mut(&conversation_id) {
-        if conversation.status != ConversationStatus::Pending {
-            return HttpResponse::BadRequest().json("Conversation not in pending state");
+    if let Some(mut key_exchange) = key_exchanges.get_mut(&conversation_id) {
+        if key_exchange.status != KeyExchangeStatus::Paired {
+            return HttpResponse::BadRequest().json("Key exchange not in Paired state");
         }
 
-        conversation.encapsulated_secret = Some(req.kyber_ciphertext.clone());
-        conversation.status = ConversationStatus::Complete;
-        conversation.completed_at = Some(Utc::now());
+        key_exchange.status = KeyExchangeStatus::Complete;
+        key_exchange.completed_at = Some(Utc::now());
 
-        HttpResponse::Ok().json(conversation)
+        HttpResponse::Ok().json(key_exchange)
     } else {
         HttpResponse::NotFound().finish()
     }
 }
 
 
-// Get pending conversations where I'm the responder
-async fn get_pending_conversations(
+// Get pending key_exchanges where I'm the responder
+async fn get_initiated_exchanges(
     data: web::Data<AppState>,
     responder_falcon_pubkey: web::Path<String>,
 ) -> impl Responder {
-    let conversations = data.conversations.lock().unwrap();
+    let key_exchanges = data.key_exchanges.lock().unwrap();
 
-    let pending: Vec<_> = conversations
+    let initiated: Vec<_> = key_exchanges
         .iter()
         .filter(|(_, conv)| {
             conv.responder_falcon_pubkey == *responder_falcon_pubkey
-                && conv.status == ConversationStatus::Pending
+                && conv.status == KeyExchangeStatus::Initiated
         })
         .map(|(id, conv)| (id.clone(), conv.clone()))
         .collect();
 
-    HttpResponse::Ok().json(pending)
+    HttpResponse::Ok().json(initiated)
 }
 
-// Cleanup expired conversations periodically
-async fn cleanup_expired_conversations(data: web::Data<AppState>) {
-    let mut conversations = data.conversations.lock().unwrap();
+// Get paired key_exchanges where I'm the responder
+async fn get_paired_exchanges(
+    data: web::Data<AppState>,
+    initiator_signature: web::Path<String>,
+) -> impl Responder {
+    let key_exchanges = data.key_exchanges.lock().unwrap();
+
+    let paired: Vec<_> = key_exchanges
+        .iter()
+        .filter(|(_, conv)| {
+            conv.initiator_signature == *initiator_signature
+                && conv.status == KeyExchangeStatus::Paired
+        })
+        .map(|(id, conv)| (id.clone(), conv.clone()))
+        .collect();
+
+    HttpResponse::Ok().json(paired)
+}
+
+
+// Get completed key_exchanges where I'm the responder
+async fn get_completed_exchanges(
+    data: web::Data<AppState>,
+    responder_falcon_pubkey: web::Path<String>,
+) -> impl Responder {
+    let key_exchanges = data.key_exchanges.lock().unwrap();
+
+    let completed: Vec<_> = key_exchanges
+        .iter()
+        .filter(|(_, conv)| {
+            conv.responder_falcon_pubkey == *responder_falcon_pubkey
+                && conv.status == KeyExchangeStatus::Complete
+        })
+        .map(|(id, conv)| (id.clone(), conv.clone()))
+        .collect();
+
+    HttpResponse::Ok().json(completed)
+}
+
+
+// Cleanup expired key_exchanges periodically
+async fn cleanup_expired_exchanges(data: web::Data<AppState>) {
+    let mut key_exchanges = data.key_exchanges.lock().unwrap();
     let expiry_time = Utc::now() - chrono::Duration::hours(24);
 
-    conversations.retain(|_, conv| {
-        if conv.status == ConversationStatus::Pending && conv.created_at < expiry_time {
-            conv.status = ConversationStatus::Expired;
+    key_exchanges.retain(|_, conv| {
+        if conv.status == KeyExchangeStatus::Initiated && conv.created_at < expiry_time {
+            conv.status = KeyExchangeStatus::Expired;
             false
         } else {
             true
@@ -198,7 +277,7 @@ async fn cleanup_expired_conversations(data: web::Data<AppState>) {
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
     let app_state = web::Data::new(AppState {
-        conversations: Mutex::new(HashMap::new()),
+        key_exchanges: Mutex::new(HashMap::new()),
         messages: Mutex::new(HashMap::new()),
     });
 
@@ -207,9 +286,12 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .route("/conversations", web::post().to(init_conversation))
-            .route("/conversations/complete", web::post().to(complete_conversation))
-            .route("/conversations/pending/{pubkey}", web::get().to(get_pending_conversations))
+            .route("/exchanges/init", web::post().to(init_key_exchange))
+            .route("/exchanges/pair", web::post().to(pair_exchange))
+            .route("/exchanges/complete", web::post().to(complete_exchange))
+            .route("/exchanges/initiated/{pubkey}", web::get().to(get_initiated_exchanges))
+            .route("/exchanges/paired/{pubkey}", web::get().to(get_paired_exchanges))
+            .route("/exchanges/complete/{pubkey}", web::get().to(get_completed_exchanges))
             .route("/messages", web::post().to(store_message))
             .route("/messages/{recipient}", web::get().to(get_messages))
     })
