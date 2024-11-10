@@ -291,7 +291,7 @@ async fn main() -> std::io::Result<()> {
             .route("/exchanges/complete", web::post().to(complete_exchange))
             .route("/exchanges/initiated/{pubkey}", web::get().to(get_initiated_exchanges))
             .route("/exchanges/paired/{pubkey}", web::get().to(get_paired_exchanges))
-            .route("/exchanges/complete/{pubkey}", web::get().to(get_completed_exchanges))
+            .route("/exchanges/completed/{pubkey}", web::get().to(get_completed_exchanges))
             .route("/messages", web::post().to(store_message))
             .route("/messages/{recipient}", web::get().to(get_messages))
     })

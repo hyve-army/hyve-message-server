@@ -6,7 +6,8 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # Base URL for the API
-BASE_URL="http://localhost:8080"
+BASE_URL="https://hyveapi.net"
+#BASE_URL="http://localhost:8080"
 
 # Test data
 INITIATOR_FALCON_PUBKEY="initiatorFalconKey123"
